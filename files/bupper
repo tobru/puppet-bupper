@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'net/smtp'
+require 'optparse'
+require 'open3'
+require 'logger'
+
+options = {}
+
+opt_parser = OptionParser.new do |opt|
+  opt.banner = 'Usage: bupper COMMAND [OPTIONS]'
+  opt.separator  ''
+  opt.separator  'Commands'
+  opt.separator  '     backup: run backup for the specified profile, or all'
+  opt.separator  '     restore: initialize all the things to restore a backup (mainly: mount sshfs)'
+  opt.separator  ''
+  opt.separator  'Options'
+
+  options[:profile] = 'all'
+  opt.on('-p','--profile PROFILE','name of the profile as specified in the configuration file, defaults to all') do |profile|
+    options[:profile] = profile
+  end
+
+  options[:config] = '/etc/bupper.yml'
+  opt.on('-c','--config FILENAME','filename of the config file, including the path') do |config|
+    options[:config] = config
+  end
+
+  opt.on('-h','--help','help') do
+    puts opt_parser
+  end
+end
+
+opt_parser.parse!
+action = ARGV[0]
+
+# load and parse configuration
+if File.exists?(options[:config])
+  configuration = YAML.load_file(options[:config])
+else
+  puts "Configuration file #{options[:config]} not found"
+  exit 1
+end
+
+# setup logging
+if not File.exist?(configuration['global']['log_dir'])
+  puts "Log directory #{configuration['global']['log_dir']} does not exist"
+  exit 1
+end
+class MultiIO
+  def initialize(*targets)
+     @targets = targets
+  end
+
+  def write(*args)
+    @targets.each {|t| t.write(*args)}
+  end
+
+  def close
+    @targets.each(&:close)
+  end
+end
+log_file = File.open(configuration['global']['log_dir'] + '/bupper.log', 'a')
+@log = Logger.new MultiIO.new(STDOUT, log_file)
+case configuration['global']['log_level']
+  when 'debug' then @log.level = Logger::DEBUG
+  when 'info' then @log.level = Logger::INFO
+  when 'warn' then @log.level = Logger::WARN
+  when 'error' then @log.level = Logger::ERROR
+  when 'fatal' then @log.level = Logger::FATAL
+  when 'unknown' then @log.level = Logger::UNKNOWN
+end
+
+def run_command(command)
+  @log.info('running command: ' + command)
+  if system(command)
+    @log.info('command successful')
+    return true
+  else
+    @log.error('command failed')
+    return false
+  end
+end
+
+def backup(name, profile)
+  @log.info('action: backup. profile: ' + name)
+
+  # run pre_backup_commands if configured
+  profile['pre_backup_commands'].each do |command| run_command(command)
+    end if profile.has_key?('pre_backup_commands')
+
+  # run bup index
+  index_status = bup_index(name, profile)
+
+  # run bup save if indexing was successfull
+  bup_save(name, profile) if index_status
+
+  # run post_backup_commands if configured
+  profile['post_backup_commands'].each do |command| run_command(command)
+    end if profile.has_key?('post_backup_commands')
+end
+
+def bup_index(name, profile)
+  @log.info('running bup index for profile ' + name)
+
+  # define bup_dir
+  if profile.has_key?('bup_dir')
+    bup_dir = profile['bup_dir']
+  else
+    bup_dir = '/root/.bup'
+  end
+
+  # define command to run
+  excludes = ''
+  profile['backup_exclude'].each do |exclude| excludes << '--exclude=' + exclude + ' ' end if profile.has_key?('backup_exclude')
+  profile['backup_exclude_rx'].each do |exclude| excludes << '--exclude-rx=' + exclude + ' ' end if profile.has_key?('backup_exclude_rx')
+
+  command = "bup index -x -f #{bup_dir}/index_#{name} #{excludes} #{profile['source'].join(' ')}"
+
+  @log.debug("BUP_DIR=#{bup_dir}")
+  @log.debug(command)
+  if system({'BUP_DIR' => bup_dir}, command)
+    @log.info('indexing successful for profile ' + name)
+    return true
+  else
+    @log.error('indexing failed for profile ' + name)
+    return false
+  end
+end
+
+def bup_save(name, profile)
+  @log.info('running bup save for profile ' + name)
+
+  # define bup_dir
+  if profile.has_key?('bup_dir')
+    bup_dir = profile['bup_dir']
+  else
+    bup_dir = '/root/.bup'
+  end
+
+  # decide if the destination is remote or not
+  if profile.has_key?('remote') then remote = profile['remote'] else remote = false end
+  if remote
+    command = "bup save -r #{profile['destination']} -n #{name} -f #{bup_dir}/index_#{name} " + profile['source'].join(' ')
+  else
+    command = "bup save -n #{name} -f #{bup_dir}/index_#{name} " + profile['source'].join(' ')
+  end
+ 
+  @log.debug("BUP_DIR=#{bup_dir}")
+  @log.debug(command)
+  if system({'BUP_DIR' => bup_dir}, command)
+    @log.info('saving successful for profile ' + name)
+    return true
+  else
+    @log.error('saving failed for profile ' + name)
+    return false
+  end
+end
+
+def restore_help(name, profile)
+
+  # define bup_dir
+  if profile.has_key?('bup_dir')
+    bup_dir = profile['bup_dir']
+  else
+    bup_dir = '/root/.bup'
+  end
+
+  puts ""
+  puts "Restore help (profile #{name})"
+  puts "------------"
+
+  if profile.has_key?('remote') then remote = profile['remote'] else remote = false end
+  if remote
+    puts "This profile has it's data saved on a remote server: #{profile['destination']}"
+    puts ""
+    puts "You need to mount the remote directory with sshfs:"
+    puts ""
+    puts "  sshfs is not installed!" if not File.exists?('/usr/bin/sshfs')
+    puts "  apt-get install sshfs" if not File.exists?('/usr/bin/sshfs')
+    puts "  mkdir /mnt/#{name}" if not File.exist?("/mnt/#{name}")
+    puts "  sshfs #{profile['destination']} /mnt/#{name}" if File.exists?('/usr/bin/sshfs')
+    puts ""
+    puts "Now use the bup commands to restore files:"
+    puts ""
+    puts "  BUP_DIR=/mnt/#{name} bup ls"
+    puts "  BUP_DIR=/mnt/#{name} bup restore"
+    puts ""
+    puts "When finished:"
+    puts "  umount /mnt/#{name}"
+    puts ""
+  else
+    puts "This profile has it's data saved local on this server"
+    puts ""
+    puts "Use the bup commands to restore files:"
+    puts ""
+    puts "  BUP_DIR=#{bup_dir} bup ls"
+    puts "  BUP_DIR=#{bup_dir} bup restore"
+    puts ""
+  end
+
+end
+
+# do the action
+case action
+  when 'backup'
+    if options[:profile].match('all')
+      configuration['profiles'].each do |name, profile|
+        if profile.has_key?('enabled') then enabled = profile['enabled'] else enabled = true end
+        backup(name, profile) if enabled
+        @log.info("profile #{name} is disabled for 'all' backup. skipping.") if not enabled
+      end
+    elsif configuration['profiles'].has_key?(options[:profile])
+      backup(options[:profile], configuration['profiles'][options[:profile]])
+    else
+      @log.fatal('profile ' + options[:profile] + ' not found in configuration')
+      exit 1
+    end
+  when 'restore'
+    if options[:profile].match('all')
+      configuration['profiles'].each do |name, profile|
+        restore_help(name, profile)
+      end
+    elsif configuration['profiles'].has_key?(options[:profile])
+      restore_help(options[:profile], configuration['profiles'][options[:profile]])
+    else
+      @log.fatal('profile ' + options[:profile] + ' not found in configuration')
+      exit 1
+    end
+  else
+    puts opt_parser
+end
+
+# cleanup
+@log.close
